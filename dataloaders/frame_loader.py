@@ -1,10 +1,12 @@
 import zipfile
 import os
+import sys
 import shutil
 import polars as pl 
 import subprocess
 import tempfile
-import Dracopy
+import DracoPy
+import base64
 from huggingface_hub import hf_hub_download
 
 # ========= DATASET DIRECTORIES =========
@@ -94,11 +96,10 @@ class NvidiaPhysicalAIDataloader:
             - clip: 20 sec piece of data for a sensor
             - chunk: group of 100 clips
         """
-        self.chunk_counter = 0
+        self.chunk_counter = -1
         self.clip_counter = 0
         self.snippet_counter = 0
-        assert(CLIP_LENGTH_SEC % dataloader_cfg["snippet_length_sec"] == 0,
-               "snippet length must be a divisor of clip length")
+        assert CLIP_LENGTH_SEC % dataloader_cfg["snippet_length_sec"] == 0, "snippet length must be a divisor of clip length"
         self.snippet_length_sec = dataloader_cfg["snippet_length_sec"]
         self.snippet_length_msec = self.snippet_length_sec * 1000
         self.snippets_per_clip = CLIP_LENGTH_SEC / self.snippet_length_sec
@@ -111,7 +112,9 @@ class NvidiaPhysicalAIDataloader:
     
     def delete_chunk(self):
         for sensor_name in ["camera", "lidar", "radar"]:
-            shutil.rmtree(os.path.join(HF_REPO_ID, sensor_name))
+            folder_to_delete = os.path.join(HF_REPO_ID, sensor_name)
+            if os.path.exists(folder_to_delete):
+                shutil.rmtree(folder_to_delete)
 
     def download_chunk(self):
         for sensor_type, sensor_list in self.str_to_sensor_map.items():
@@ -129,27 +132,33 @@ class NvidiaPhysicalAIDataloader:
                     zip_ref.extractall(extract_dir)
     
     def load_clips(self):
-        def load_video_clip(clip_id
+        def load_video_clip(clip_id,
                             sensor_type,
                             sensor_name):
             video_root = f"{sensor_type}/{sensor_name}"
             video_to_load = f"{clip_id}.{sensor_name}.mp4"
-            video_path = os.path.join(video_root, video_to_load)
+            video_path = os.path.join(HF_REPO_ID, video_root, video_to_load)
             
             # use ffmpeg to split into snippets and load all of them
             temp_dir = tempfile.mkdtemp()
             output_pattern = os.path.join(temp_dir, "clip_%03d.mp4")
-            cmd = [
-                'ffmpeg',
-                '-i', video_path,
-                '-c', 'copy',  # Copy without re-encoding
-                '-f', 'segment',
-                '-segment_time', str(clip_duration_sec),
-                '-reset_timestamps', '1',
-                output_pattern,
-                '-y'  # Overwrite without asking
-            ]
-            subprocess.run(cmd, check=True, capture_output=True)
+            try:
+                cmd = [
+                    'ffmpeg',
+                    '-i', video_path,
+                    '-c', 'copy',  # Copy without re-encoding
+                    '-f', 'segment',
+                    '-segment_time', str(self.snippet_length_sec),
+                    '-reset_timestamps', '1',
+                    output_pattern,
+                    '-y'  # Overwrite without asking
+                ]
+                subprocess.run(cmd, check=True, capture_output=True)
+            except Exception as e:
+                print(e)
+                print(f"removing temp directory: {output_pattern}")
+                shutil.rmtree(temp_dir)
+                sys.exit()
 
             clips_b64 = []
             clip_files = sorted([f for f in os.listdir(temp_dir) if f.startswith('clip_')])
@@ -183,12 +192,12 @@ class NvidiaPhysicalAIDataloader:
     def load_snippets(self):
         # assumes that self.unified_clips has been updated to contain the 
         # most up-to-date frames
-        def load_video_snippet(self,
+        def load_video_snippet(snippet_counter,
                                sensor_type,
                                sensor_name):
             return self.unified_clips[sensor_type, sensor_name][self.snippet_counter]
         
-        def load_pc_snippet(self,
+        def load_pc_snippet(snippet_counter,
                             sensor_type,
                             sensor_name):
             #TODO (Ankit): Technically doesn't make any sense to return a pc snippet
@@ -200,9 +209,9 @@ class NvidiaPhysicalAIDataloader:
         for sensor_type, sensor_list in self.str_to_sensor_map.items():
             for sensor_name in sensor_list:
                 if sensor_type == "camera":
-                    unified_snippets[sensor_type, sensor_name] = load_video_snippet(sensor_type, sensor_name)
+                    unified_snippets[sensor_type, sensor_name] = load_video_snippet(self.snippet_counter, sensor_type, sensor_name)
                 else:
-                    unified_snippets[sensor_type, sensor_name] = load_pc_snippet(sensor_type, sensor_name)
+                    unified_snippets[sensor_type, sensor_name] = load_pc_snippet(self.snippet_counter, sensor_type, sensor_name)
         return unified_snippets
     
     # each clip is 20 sec long. for good performance of the embedding model,
@@ -211,9 +220,9 @@ class NvidiaPhysicalAIDataloader:
         if(self.snippet_counter == 0):
             chunk = self.clips_df[self.clip_counter]["chunk"].item()
             if(chunk > self.chunk_counter):
-                self.delete_chunk()
+                # self.delete_chunk()
                 self.chunk_counter = chunk
-                self.download_chunk()
+                # self.download_chunk()
             self.unified_clips = self.load_clips()
 
         unified_snippets = self.load_snippets()

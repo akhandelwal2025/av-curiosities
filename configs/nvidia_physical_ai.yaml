@@ -1,0 +1,8 @@
+# ===== SENSOR-BASED CONFIGS =====
+use_cameras: true
+use_lidars: false
+use_radars: false
+
+snippet_length_sec: 1.0
+
+
