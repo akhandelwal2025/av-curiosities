@@ -110,17 +110,29 @@ class NvidiaPhysicalAIDataloader:
             "radar": RADAR_NAMES if self.dataloader_cfg["use_radars"] else []
         }
     
-    def delete_chunk(self):
-        for sensor_name in ["camera", "lidar", "radar"]:
-            folder_to_delete = os.path.join(HF_REPO_ID, sensor_name)
-            if os.path.exists(folder_to_delete):
-                shutil.rmtree(folder_to_delete)
+    def delete_chunk(self, chunk_num):
+        for sensor_type, sensor_list in self.str_to_sensor_map.items():
+            for sensor_name in sensor_list:
+                folder_to_delete = os.path.join(
+                    HF_REPO_ID,
+                    f"{sensor_type}/{sensor_name}",
+                    f"chunk_{chunk_num:04d}"
+                )
+                if os.path.exists(folder_to_delete):
+                    shutil.rmtree(folder_to_delete)
 
-    def download_chunk(self):
+    def download_chunk(self, chunk_num):
         for sensor_type, sensor_list in self.str_to_sensor_map.items():
             for sensor_name in sensor_list:
                 zip_root = f"{sensor_type}/{sensor_name}"
-                zip_to_download = f"{sensor_name}.chunk_{self.chunk_counter:04d}.zip"
+                zip_to_download = f"{sensor_name}.chunk_{chunk_num:04d}.zip"
+                extract_dir = os.path.join(HF_REPO_ID, zip_root, f"chunk_{chunk_num:04d}")
+
+                # skip if the folder is already downloaded
+                if os.path.exists(extract_dir):
+                    continue
+                
+                # download data from hf and unzip it
                 zip_path = hf_hub_download(
                     repo_id = HF_REPO_ID,
                     filename = os.path.join(zip_root, zip_to_download),
@@ -128,14 +140,17 @@ class NvidiaPhysicalAIDataloader:
                     local_dir = HF_REPO_ID,
                 )
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    extract_dir = os.path.join(HF_REPO_ID, zip_root)
                     zip_ref.extractall(extract_dir)
+                
+                # delete zip file
+                os.remove(os.path.join(HF_REPO_ID, zip_root, zip_to_download))
     
     def load_clips(self):
-        def load_video_clip(clip_id,
+        def load_video_clip(chunk_num,
+                            clip_id,
                             sensor_type,
                             sensor_name):
-            video_root = f"{sensor_type}/{sensor_name}"
+            video_root = f"{sensor_type}/{sensor_name}/chunk_{chunk_num:04d}"
             video_to_load = f"{clip_id}.{sensor_name}.mp4"
             video_path = os.path.join(HF_REPO_ID, video_root, video_to_load)
             
@@ -170,10 +185,11 @@ class NvidiaPhysicalAIDataloader:
                     clips_b64.append(clip_b64)
             return clips_b64
             
-        def load_pc_parquet_clip(clip_id,
+        def load_pc_parquet_clip(chunk_num,
+                                 clip_id,
                                  sensor_type,
                                  sensor_name):
-            pc_root = f"{sensor_type}/{sensor_name}"
+            pc_root = f"{sensor_type}/{sensor_name}/chunk_{chunk_num:04d}"
             pc_to_load = f"{clip_id}.{sensor_name}.parquet"
             pc_path = os.path.join(pc_root, pc_to_load)
             pc_df = pl.read_parquet(pc_path)
@@ -184,9 +200,9 @@ class NvidiaPhysicalAIDataloader:
         for sensor_type, sensor_list in self.str_to_sensor_map.items():
             for sensor_name in sensor_list:
                 if sensor_type == "camera":
-                    unified_clips[sensor_type, sensor_name] = load_video_clip(clip_id, sensor_type, sensor_name)
+                    unified_clips[sensor_type, sensor_name] = load_video_clip(self.chunk_counter, clip_id, sensor_type, sensor_name)
                 else:
-                    unified_clips[sensor_type, sensor_name] = load_pc_parquet_clip(clip_id, sensor_type, sensor_name)
+                    unified_clips[sensor_type, sensor_name] = load_pc_parquet_clip(self.chunk_counter, clip_id, sensor_type, sensor_name)
         return unified_clips
 
     def load_snippets(self):
@@ -195,15 +211,7 @@ class NvidiaPhysicalAIDataloader:
         def load_video_snippet(snippet_counter,
                                sensor_type,
                                sensor_name):
-            return self.unified_clips[sensor_type, sensor_name][self.snippet_counter]
-        
-        def load_pc_snippet(snippet_counter,
-                            sensor_type,
-                            sensor_name):
-            #TODO (Ankit): Technically doesn't make any sense to return a pc snippet
-            # this will never be used. Instead this function should return pc frames
-            # which is probably what the whole dataloader should become
-            return None
+            return self.unified_clips[sensor_type, sensor_name][snippet_counter]
         
         unified_snippets = NvidiaPhysicalAIUnifiedFrame()
         for sensor_type, sensor_list in self.str_to_sensor_map.items():
@@ -211,18 +219,24 @@ class NvidiaPhysicalAIDataloader:
                 if sensor_type == "camera":
                     unified_snippets[sensor_type, sensor_name] = load_video_snippet(self.snippet_counter, sensor_type, sensor_name)
                 else:
-                    unified_snippets[sensor_type, sensor_name] = load_pc_snippet(self.snippet_counter, sensor_type, sensor_name)
+                    # it doesn't make sense to return a lidar or radar pointcloud "snippet". this will never be used
+                    # threfore, just return None
+                    unified_snippets[sensor_type, sensor_name] = None
         return unified_snippets
+    
+    # TODO (Ankit): implement this. does it make sense to generate_frames across videos?
+    def load_frames(self):
+        pass
     
     # each clip is 20 sec long. for good performance of the embedding model,
     # need to return snippets that are X sec long. 
-    def __iter__(self):
+    def generate_snippets(self):
         if(self.snippet_counter == 0):
             chunk = self.clips_df[self.clip_counter]["chunk"].item()
             if(chunk > self.chunk_counter):
-                # self.delete_chunk()
+                self.download_chunk(chunk)
+                self.delete_chunk(self.chunk_counter)
                 self.chunk_counter = chunk
-                # self.download_chunk()
             self.unified_clips = self.load_clips()
 
         unified_snippets = self.load_snippets()
